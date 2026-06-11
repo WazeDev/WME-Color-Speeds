@@ -2,13 +2,13 @@
 // ==UserScript==
 // @name             WME Color Speeds
 // @name:fr          WME Color Speeds
-// @version          2025.02.04.01
+// @version          2026.06.11.01
 // @description      Adds colors to road segments to show their speed
 // @description:fr   Colorisation des segments selon leurs vitesses.
-// @include          https://www.waze.com/editor*
-// @include          https://www.waze.com/*/editor*
-// @include          https://beta.waze.com/editor*
-// @include          https://beta.waze.com/*/editor*
+// @match            https://www.waze.com/*/editor*
+// @match            https://www.waze.com/editor*
+// @match            https://beta.waze.com/*/editor*
+// @match            https://beta.waze.com/editor*
 // @exclude          https://www.waze.com/user*
 // @exclude          https://www.waze.com/*/user*
 // @grant            GM_xmlhttpRequest
@@ -25,6 +25,9 @@
 /* global CSpeedsWaze */
 /* global I18n */
 /* global $ */
+/* global getWmeSdk */
+
+let wmeSDK;
 
 // *********************
 // **  DECLARATIONS   **
@@ -34,8 +37,8 @@
 const scriptName = GM_info.script.name;
 // eslint-disable-next-line camelcase
 const currentVersion = GM_info.script.version;
-const changelogFrench = 'UPDATED: Rollback code';
-const changelogEnglish = 'UPDATED: Rollback code';
+const changelogFrench = 'UPDATED: Migration vers le nouveau SDK WME (2026)';
+const changelogEnglish = 'UPDATED: Migrated to WME JavaScript SDK (2026) - replaced deprecated OpenLayers 2 layer API';
 // eslint-disable-next-line camelcase
 const greasyForkUrl = GM_info.script.namespace;
 const downloadUrl = 'https://greasyfork.org/scripts/14044-wme-color-speeds/code/wme-color-speeds.user.js';
@@ -157,7 +160,8 @@ let unit;
 let selectedState;
 let selectedCountry;
 
-let mapLayer = [];
+let mapLayer = null;
+let _csLayerFeatureIds = [];  // track added feature IDs for cleanup
 let toggler;
 let groupToggler;
 
@@ -205,22 +209,6 @@ const roadTypeZoomInfo = {
 //  19: "Runway/Taxiway"
 //  21: "Service Road"
 
-// WMECSpeeds.selectedRoadType = [];
-/*
-const dashStyles = [
-    'Solid',
-    'ShortDash',
-    'ShortDot',
-    'ShortDashDot',
-    'ShortDashDotDot',
-    'Dot',
-    'Dash',
-    'LongDash',
-    'DashDot',
-    'LongDashDot',
-    'LongDashDotDot'
-];
-*/
 let CSI18n = 'en';
 
 const CSlang = {
@@ -469,7 +457,7 @@ function roundDecimals(c) {
 
 function checkUnit() {
     // eslint-disable-next-line no-undef
-    if (CSpeedsModel.isImperial) {
+    if (wmeSDK.Settings.getUserSettings().isImperial) {
         unit = 'mph';
     } else {
         unit = 'kmh';
@@ -484,6 +472,9 @@ function checkUnit() {
 }
 
 function createToggler() {
+    // SDK LayerSwitcher already handles the checkbox via wmeSDK.LayerSwitcher.addLayerCheckbox
+    // Manual toggler creation disabled to avoid duplicate entries
+    return;
     // Layers switcher
     // test with script toggler----------------
     const oldTogglers = document.querySelectorAll('.togglers');
@@ -524,13 +515,13 @@ function createToggler() {
             toggler.disabled = !groupToggler.checked;
 
             toggler.addEventListener('click', e => {
-                mapLayer.setVisibility(e.target.checked);
+                // Legacy toggler removed - handled by wme-layer-checkbox-toggled
                 saveOption();
             });
 
             groupToggler.addEventListener('click', e => {
                 toggler.disabled = !e.target.checked;
-                mapLayer.setVisibility(toggler.checked ? e.target.checked : toggler.checked);
+                // Legacy group toggler removed - handled by wme-layer-checkbox-toggled
                 localStorage.setItem('groupScriptsToggler', e.target.checked);
             });
         }
@@ -551,17 +542,16 @@ function changelogLocalizer() {
 }
 
 function getTopCountry() {
-    // eslint-disable-next-line no-undef
-    return CSpeedsModel.getTopCountry();
+    return wmeSDK.DataModel.Countries.getTopCountry();
 }
 
 function getTopState() {
-    // eslint-disable-next-line no-undef
-    return CSpeedsModel.getTopState();
+    return wmeSDK.DataModel.States.getTopState();
 }
 
 function saveOption() {
-    WMECSpeeds.togglerChecked = getId('layer-switcher-item_WME_Color_Speeds').checked;
+    // togglerChecked is updated directly by the wme-layer-checkbox-toggled handler
+    // Don't try to read the old DOM element which no longer exists
     localStorage.setItem('WMEColorSpeeds', JSON.stringify(WMECSpeeds));
 }
 function destroyTab() {
@@ -579,12 +569,14 @@ function counterStart() {
 
 function bootstrap() {
     scriptStartTime = performance.now();
-    // eslint-disable-next-line no-undef
-    if (WazeWrap?.Ready && W?.userscripts?.state.isReady) {
+    if (typeof getWmeSdk === 'function' && WazeWrap?.Ready && W?.userscripts?.state?.isReady) {
+        if (!wmeSDK) {
+            wmeSDK = getWmeSdk({ scriptId: 'WMEColorSpeeds', scriptName: 'WME Color Speeds' });
+        }
         log('Starting');
         init();
     } else {
-        if (debug) log('WME and WW not ready');
+        if (debug) log('WME SDK or WazeWrap not ready');
         setTimeout(bootstrap, 500);
     }
 }
@@ -615,61 +607,34 @@ function loadScriptUpdateMonitor() {
 function init() {
     loadScriptUpdateMonitor();
     showScriptInfoAlert();
-    // Waze object needed
-    // eslint-disable-next-line no-undef
-    CSpeedsWaze = unsafeWindow.W;
-    if (typeof (CSpeedsWaze) === 'undefined') {
-        if (debug) { console.error('WME ColorSpeeds - CSpeedsWaze : NOK'); }
-        window.setTimeout(init, 500);
-        return;
-    }
-    // eslint-disable-next-line no-undef
-    CSpeedsMap = CSpeedsWaze.map;
-    if (typeof (CSpeedsMap) === 'undefined') {
-        if (debug) { console.error('WME ColorSpeeds - CSpeedsmap : NOK'); }
-        window.setTimeout(init, 500);
-        return;
-    }
-    // eslint-disable-next-line no-undef
-    CSpeedsModel = CSpeedsWaze.model;
-    if (typeof (CSpeedsModel) === 'undefined') {
-        if (debug) { console.error('WME ColorSpeeds - CSpeedsModel DOM : NOK'); }
+
+    // Check SDK is available
+    if (typeof wmeSDK === 'undefined') {
+        if (debug) { console.error('WME ColorSpeeds - wmeSDK not ready'); }
         window.setTimeout(init, 500);
         return;
     }
 
-    // eslint-disable-next-line no-undef
-    CSpeedsCountries = CSpeedsModel.countries;
-    if (typeof (CSpeedsCountries) === 'undefined') {
-        if (debug) { console.error('WME ColorSpeeds - CSpeedsCountries DOM : NOK'); }
+    // Check top country available
+    if (getTopCountry() === null || getTopCountry() === undefined) {
+        if (debug) { console.error('WME ColorSpeeds - TopCountry not ready'); }
         window.setTimeout(init, 500);
         return;
     }
-    CSpeedsTopCountries = getTopCountry();
-    if (typeof (CSpeedsTopCountries) === 'undefined' || getTopCountry() === null) {
-        if (debug) { console.error('WME ColorSpeeds - CSpeedsCountries.top DOM : NOK'); }
+    if (typeof (getTopCountry().name) === 'undefined') {
+        if (debug) { console.error('WME ColorSpeeds - TopCountry.name not ready'); }
         window.setTimeout(init, 500);
         return;
     }
-    if (typeof (getTopCountry().attributes.name) === 'undefined') {
-        if (debug) { console.error('WME ColorSpeeds - CSpeedsCountries.top.name DOM : NOK'); }
-        window.setTimeout(init, 500);
-        return;
-    }
-    //    OpenLayers
-    CSpeedOpenLayers = unsafeWindow.OpenLayers;
-    if (typeof (CSpeedOpenLayers) === 'undefined') {
-        if (debug) { console.error('WME ColorSpeeds - OpenLayers : NOK'); }
-        window.setTimeout(init, 500);
-        return;
-    }
-    //    Traductions
-    CSpeedI18n = I18n.locale;
-    if (typeof(CSpeedI18n) === 'undefined') {
-        if (debug) { console.error('WME ColorSpeeds - CSpeedI18n : NOK'); }
-        setTimeout(init, 500);
-        return;
-    }
+
+    // Language
+    CSpeedI18n = (typeof I18n !== 'undefined') ? I18n.locale : 'en';
+    if (typeof(CSpeedI18n) === 'undefined') { CSpeedI18n = 'en'; }
+
+    // Keep backward compat references
+    CSpeedsWaze = unsafeWindow.W;
+    CSpeedsModel = CSpeedsWaze?.model;
+    CSpeedsCountries = CSpeedsModel?.countries;
 
     // Verify localStorage. Init if empty or not correct
     if (typeof (localStorage.WMEColorSpeeds) !== 'undefined' && IsJsonString(localStorage.getItem('WMEColorSpeeds'))) {
@@ -688,14 +653,7 @@ function init() {
             }
         }
         if (WMECSpeeds.togglerChecked === undefined) WMECSpeeds.togglerChecked = WMECSpeeds.visibility;
-        /* this if statement is no longer needed with WW
-        if (WMECSpeeds.version === undefined) {
-            oldScriptVersion = 0;
-        } else if (WMECSpeeds.version !== undefined) {
-            oldScriptVersion = WMECSpeeds.version;
-        }
-        */
-        WMECSpeeds.MultiplePalette = (getTopCountry().attributes.name === 'United States') ? WMECSpeeds.MultiplePalette : false;
+        WMECSpeeds.MultiplePalette = (getTopCountry().name === 'United States') ? WMECSpeeds.MultiplePalette : false;
         //        WMECSpeeds.MultiplePalette = (CSpeedsCountries.top.name == "United States")? WMECSpeeds.MultiplePalette : false;
 
         log('Init ok');
@@ -716,59 +674,75 @@ function init() {
 
     checkUnit();
 
-    // WME Layers check
-    let layers = CSpeedsMap.getLayersBy('uniqueName', 'WME_Color_Speeds');
-    if (layers.length === 0) {
-        I18n.translations[CSpeedI18n].layers.name['WME_Color_Speeds'] = 'Color Speeds';
-
-        const colorspeedsStyle = new CSpeedOpenLayers.Style({
-            pointRadius: 2,
-            fontWeight: 'normal',
-            label: '${labelText}',
-            fontFamily: 'Tahoma, Courier New',
-            labelOutlineColor: '#FFFFFF',
-            labelOutlineWidth: 2,
-            fontColor: '#000000',
-            fontSize: '10px'
+    // WME Layers check - use SDK Map API (no direct ol access needed)
+    const CS_LAYER_NAME = 'Color Speeds';
+    if (!mapLayer || !mapLayer.name) {
+        // Use SDK's addLayer API which manages ol internally
+        wmeSDK.Map.addLayer({
+            layerName: CS_LAYER_NAME,
+            styleContext: {
+                strokeColor: (context) => context?.feature?.properties?.style?.strokeColor || '#ff0000',
+                strokeOpacity: (context) => context?.feature?.properties?.style?.strokeOpacity ?? 0.8,
+                strokeWidth: (context) => context?.feature?.properties?.style?.strokeWidth ?? 6,
+                strokeDashstyle: (context) => context?.feature?.properties?.style?.strokeDashstyle || 'Solid'
+            },
+            styleRules: [{
+                predicate: () => true,
+                style: {
+                    strokeColor: '${strokeColor}',
+                    strokeOpacity: '${strokeOpacity}',
+                    strokeWidth: '${strokeWidth}',
+                    strokeDashstyle: '${strokeDashstyle}'
+                }
+            }]
         });
+        mapLayer = { name: CS_LAYER_NAME, visible: WMECSpeeds.visibility };
+        const initialVis = WMECSpeeds.togglerChecked !== false;
+        wmeSDK.Map.setLayerVisibility({ layerName: CS_LAYER_NAME, visibility: initialVis });
+        mapLayer.visible = initialVis;
+        WMECSpeeds.visibility = initialVis;
 
-        mapLayer = new CSpeedOpenLayers.Layer.Vector(I18n.t('layers.name.WME_Color_Speeds'), {
-            displayInLayerSwitcher: true,
-            uniqueName: 'WME_Color_Speeds',
-            styleMap: new CSpeedOpenLayers.StyleMap(colorspeedsStyle)
-        });
-
-        CSpeedsMap.addUniqueLayer(mapLayer);
-        mapLayer.setVisibility(WMECSpeeds.visibility);
+        // Register layer checkbox in LayerSwitcher
+        try {
+            if (wmeSDK?.LayerSwitcher) {
+                wmeSDK.LayerSwitcher.addLayerCheckbox({ name: CS_LAYER_NAME, label: 'Color Speeds' });
+                wmeSDK.LayerSwitcher.setLayerCheckboxChecked({
+                    name: CS_LAYER_NAME,
+                    isChecked: WMECSpeeds.togglerChecked !== false
+                });
+            }
+            if (wmeSDK?.Events) {
+                wmeSDK.Events.on({
+                    eventName: 'wme-layer-checkbox-toggled',
+                    eventHandler: (e) => {
+                        if (e.name === CS_LAYER_NAME) {
+                            wmeSDK.Map.setLayerVisibility({ layerName: CS_LAYER_NAME, visibility: e.checked });
+                            WMECSpeeds.visibility = e.checked;
+                            WMECSpeeds.togglerChecked = e.checked;
+                            mapLayer.visible = e.checked;
+                            // Save without DOM access
+                            localStorage.setItem('WMEColorSpeeds', JSON.stringify(WMECSpeeds));
+                            if (e.checked) SCColor();
+                        }
+                    }
+                });
+            }
+        } catch(e) {
+            if (debug) log('LayerSwitcher not available: ' + e);
+        }
     }
 
     createToggler();
-
-    // MTE mode event
-    /*
-      W.app.modeController.model.bind('change:mode', function(){
-      if (W.app.modeController.getState() !== undefined){
-        eventUnRegister();
-        try { colorspeeds_mapLayer.destroyFeatures();
-        }catch(err){log('err destroyFeatures: ',err);}
-      }
-      if (W.app.modeController.getState() === undefined){
-        eventUnRegister();
-        createToggler();
-        CSpeeds_css();
-      }
-    });
-    */
     // reload after changing WME units
-    W.prefs.on('change:isImperial', () => {
-        destroyTab();
-        eventUnRegister();
-        checkUnit();
-        createToggler();
-        createCSS();
-    });
-
-    // log('colorspeeds_mapLayer ',colorspeeds_mapLayer);
+    if (wmeSDK?.Events) {
+        wmeSDK.Events.on({ eventName: 'wme-user-settings-changed', eventHandler: () => {
+            destroyTab();
+            eventUnRegister();
+            checkUnit();
+            createToggler();
+            createCSS();
+        }});
+    }
 
     // Then running
     createCSS();
@@ -812,8 +786,6 @@ function createCSS() {
     css += '#ConfColor.dropdown-menu li:hover, #ConfColor+.dropdown-menu li:active, #ConfColor+.dropdown-menu li:focus { cursor: pointer; outline: #3B99FC dotted 1px; }';
     css += '#ConfColor.btn { box-shadow: inset 0px -1px 0px rgba(0,0,0,0.2); border-radius: 4px; border: 1px solid rgba(0,0,0,0.25); height:22px; width:90px; }';
     css += '#nameColor {width:120px; height:22px;}';
-    // css +="#ConfDash.dropdown-menu li:hover, #ConfDash+.dropdown-menu li:active, #ConfDash+.dropdown-menu li:focus { cursor: pointer; outline: #3B99FC dotted 1px; }";
-    // css +="#ConfDash.btn { box-shadow: inset 0px -1px 0px rgba(0,0,0,0.2); border-radius: 4px; border: 1px solid rgba(0,0,0,0.25); height:22px; width:90px; }";
     CSpeedsCSS.innerHTML = css;
     document.body.appendChild(CSpeedsCSS);
     createTab();
@@ -1011,25 +983,8 @@ async function createTab() {
     content += "<div class='divr'><input id='sliderThickness' type='range' max='10' min='2' step='1' style='width:180px;height:24px;margin-right:20px;'></div>";
     content += '</div>';
 
-    /*
-    // 2023-09-26 SS28 I haven't taken the time to see what is wrong here. Maybe we can resurrect it
-    // Dash Style
-    content += "<div class='divContentConf'>";
-    content += "<div style='clear:both; padding-top:10px;'></div>";
-    content += "<div class='divll' style='width:140px;font-weight:bold;color:#59899e;'>Dash Style:</div>";
-    content += "<div class='divl dropdown' style='width:90px; text-align:left;'><button id='ConfDash' class='btn dropdown-toggle' style='background-color:rgb(255,255,255);' type='button' data-toggle='dropdown'></button><ul class='dropdown-menu' style='height: 400px; overflow: scroll; margin: 0; padding: 0; min-width: 90px;'>";
-    for (let i = 0; i <= dashStyles.length; ++i) {
-        content += `<li>&nbsp;${dashStyles[i]}&nbsp;</li>`;
-    }
-    content += '</ul></div>';
-    content += '</div>';
-    */
-
     tabPane.innerHTML = content;
     tabPane.id = 'tab-colorspeeds';
-
-    // Fix tab content div spacing.
-    // $(tabPane).parent().css({ width: 'auto', padding: '4px' });
 
     await W.userscripts.waitForElementConnected(tabPane);
     if (debug) log('Tab loaded');
@@ -1050,16 +1005,16 @@ async function createTab() {
         actualiseColorRGB(c);
     });
 
-    if (debug) log(`Country = ${getTopCountry().attributes.name}`);
+    if (debug) log(`Country = ${getTopCountry().name}`);
 
     getId('cbPaletteByCountrie').checked = WMECSpeeds.PaletteByCountrie;
     getId('selectCountrie').style.display = (WMECSpeeds.PaletteByCountrie) ? 'block' : 'none';
 
-    getId('stateChoise').style.display = (getTopCountry().attributes.name === 'United States') ? 'block' : 'none';
+    getId('stateChoise').style.display = (getTopCountry().name === 'United States') ? 'block' : 'none';
 
     if (WMECSpeeds.MultiplePalette === true) {
         let index = 0;
-        const stateToSelect = getTopState().attributes.name.replace(/ /g, '_');
+        const stateToSelect = getTopState().name.replace(/ /g, '_');
         for (index; getId('selectState').options[index].value !== stateToSelect; index++) { /* empty */ }
         getId('selectState').options[index].selected = true;
     }
@@ -1081,23 +1036,22 @@ async function createTab() {
 }
 
 function eventRegister() {
-    CSpeedsWaze.selectionManager.events.register('selectionchanged', null, SCColor);
-    CSpeedsModel.actionManager.events.register('afterclearactions', null, SCColor);
-    CSpeedsModel.actionManager.events.register('afterundoaction', null, SCColor);
-    CSpeedsMap.olMap.events.register('zoomend', null, SCColor);
-    CSpeedsMap.olMap.events.register('moveend', null, SCColor);
-
-    CSpeedsModel.events.register('mergeend', null, SCColor);
+    if (!wmeSDK || !wmeSDK.Events) {
+        log('eventRegister: wmeSDK not ready, retrying...');
+        setTimeout(eventRegister, 500);
+        return;
+    }
+    wmeSDK.Events.on({ eventName: 'wme-selection-changed', eventHandler: SCColor });
+    wmeSDK.Events.on({ eventName: 'wme-after-undo', eventHandler: SCColor });
+    wmeSDK.Events.on({ eventName: 'wme-no-edits', eventHandler: SCColor });
+    wmeSDK.Events.on({ eventName: 'wme-map-zoom-changed', eventHandler: SCColor });
+    wmeSDK.Events.on({ eventName: 'wme-map-move-end', eventHandler: SCColor });
+    wmeSDK.Events.on({ eventName: 'wme-map-data-loaded', eventHandler: SCColor });
     window.addEventListener('beforeunload', saveOption, false);
 }
 
 function eventUnRegister() {
-    CSpeedsWaze.selectionManager.events.unregister('selectionchanged', null, SCColor);
-    CSpeedsModel.actionManager.events.unregister('afterclearactions', null, SCColor);
-    CSpeedsModel.actionManager.events.unregister('afterundoaction', null, SCColor);
-    CSpeedsMap.olMap.events.unregister('zoomend', null, SCColor);
-    CSpeedsMap.olMap.events.unregister('moveend', null, SCColor);
-    CSpeedsModel.events.unregister('mergeend', null, SCColor);
+    // SDK events are persistent, we just won't re-register on unit change
     window.removeEventListener('beforeunload', saveOption, false);
 }
 
@@ -1194,7 +1148,7 @@ function LoadSettings() {
     if (WMECSpeeds.PaletteByCountrie === true && WMECSpeeds.MultiplePalette === false) {
         if (getId('selectCountrie').options[getId('selectCountrie').selectedIndex] !== undefined) {
             selectedCountry = getId('selectCountrie').options[getId('selectCountrie').selectedIndex].value;
-        } else selectedCountry = getTopCountry().attributes.name.replace(/ /g, '_');
+        } else selectedCountry = getTopCountry().name.replace(/ /g, '_');
 
         log('selectCountrie = ', selectedCountry);
 
@@ -1379,7 +1333,7 @@ function setupHandler() {
         WMECSpeeds.MultiplePalette = getId('cbMultiplePalette').checked;
         WMECSpeeds.PaletteByCountrie = false;
         if (WMECSpeeds.MultiplePalette === true) {
-            const stateToSelect = getTopState().attributes.name.replace(/ /g, '_');
+            const stateToSelect = getTopState().name.replace(/ /g, '_');
             let index;
             for (index = 0; getId('selectState').options[index].value !== stateToSelect; index++) { /* empty */ }
             getId('selectState').options[index].selected = true;
@@ -1451,12 +1405,6 @@ function setupHandler() {
         rgb = color2Rgb(this.style.backgroundColor);
         actualiseColorRGB(rgb);
     });
-    /*
-  $("#ConfDash.dropdown-toggle").dropdown();
-  $('#ConfDash+.dropdown-menu li').click(function(){
-      getId('ConfDash').text=this.text;
-  });
-  */
     getId('sliderRed').onmousemove = () => {
         getId('valRed').value = getId('sliderRed').value;
         rgb.r = getId('valRed').value;
@@ -1573,13 +1521,13 @@ function updateCountrieList() {
     const selectCountrie = getId('selectCountrie');
     let current = null;
     if (selectCountrie.selectedIndex >= 0) current = selectCountrie.options[selectCountrie.selectedIndex].value;
-    if (current === null) current = getTopCountry().attributes.name.replace(/ /g, '_');
+    if (current === null) current = getTopCountry().name.replace(/ /g, '_');
 
     selectCountrie.options.length = 0;
 
     for (var countrie in WMECSpeeds.speedColors.Countries) {
         // create option in select menu
-        if (countrie === undefined) countrie = getTopCountry().attributes.name.replace(/ /g, '_');
+        if (countrie === undefined) countrie = getTopCountry().name.replace(/ /g, '_');
         var countrieOption = document.createElement('option');
         var countrieText = document.createTextNode(countrie.replace(/_/g, ' '));
 
@@ -1617,13 +1565,13 @@ function actualiseColorRGB(c) {
 }
 
 function SCSpeeds(unit, idx, state, contrie){
-    if (WMECSpeeds.MultiplePalette === true){
-        var answer = window.confirm(CSlang[5][CSI18n] + ' ' + idx + ' ' + unit + ' ' + CSlang[21][CSI18n] + ' ' + state + ' ?');
-    }else if (WMECSpeeds.PaletteByCountrie === true){
-        var answer = window.confirm(CSlang[5][CSI18n] + ' ' + idx + ' ' + unit + ' ' + CSlang[21][CSI18n] + ' ' + contrie + ' ?');
-    }else{var answer = window.confirm(CSlang[5][CSI18n] + ' ' + idx + ' ' + unit + ' ?');}
+    if (WMECSpeeds.MultiplePalette === true) {
+        let answer = window.confirm(CSlang[5][CSI18n] + ' ' + idx + ' ' + unit + ' ' + CSlang[21][CSI18n] + ' ' + state + ' ?');
+    } else if (WMECSpeeds.PaletteByCountrie === true) {
+        let answer = window.confirm(CSlang[5][CSI18n] + ' ' + idx + ' ' + unit + ' ' + CSlang[21][CSI18n] + ' ' + contrie + ' ?');
+    } else { let answer = window.confirm(CSlang[5][CSI18n] + ' ' + idx + ' ' + unit + ' ?');}
 
-    if (answer){
+    if (answer) {
         if (WMECSpeeds.MultiplePalette === true){
             delete WMECSpeeds.speedColors.US[state][unit][idx];
         }else if (WMECSpeeds.PaletteByCountrie === true){
@@ -1707,9 +1655,59 @@ function shiftGeometry(d, line, trigo) // d=distance to shift, line=collection o
         if (vcount != 0)
             v = [(prevVector[0] + nextVector[0]) / vcount, (prevVector[1] + nextVector[1]) / vcount];
         //v=normalizeVector(v);
-        points.push(new CSpeedOpenLayers.Geometry.Point(line[i].x + v[0] * d, line[i].y + v[1] * d));
+        points.push({ x: line[i].x + v[0] * d, y: line[i].y + v[1] * d });
     }
     return points;
+}
+
+// Helper: get segment vertices as {x,y} array in EPSG:900913 (Mercator)
+// SDK provides WGS84 coords; WME map/shiftGeometry works in Mercator
+function getSegmentVertices(segData) {
+    try {
+        const coords = segData.geometry.coordinates;
+        return coords.map(c => lonLatToMercator(c[0], c[1]));
+    } catch(e) {
+        return [];
+    }
+}
+
+// Convert WGS84 lon/lat to EPSG:900913 Mercator {x, y}
+function lonLatToMercator(lon, lat) {
+    const R = 6378137; // Earth radius in meters
+    const x = lon * Math.PI / 180 * R;
+    const y = Math.log(Math.tan((90 + lat) * Math.PI / 360)) * R;
+    return { x, y };
+}
+
+// Helper: convert Mercator {x,y} back to WGS84 [lon, lat]
+function mercatorToLonLat(x, y) {
+    const R = 6378137;
+    const lon = x / R * 180 / Math.PI;
+    const lat = (2 * Math.atan(Math.exp(y / R)) - Math.PI / 2) * 180 / Math.PI;
+    return [lon, lat];
+}
+
+// Helper: build a GeoJSON feature with inline style for SDK layer
+// points are in Mercator {x,y} - convert back to WGS84 for GeoJSON
+let _csFeatureId = 0;
+function makeSDKLineFeature(points, strokeColor, strokeOpacity, strokeWidth, strokeDashstyle) {
+    const coordinates = points.map(p => mercatorToLonLat(p.x, p.y));
+    return {
+        type: 'Feature',
+        id: `cs_feat_${++_csFeatureId}`,
+        geometry: {
+            type: 'LineString',
+            coordinates
+        },
+        properties: {
+            style: {
+                strokeColor,
+                strokeOpacity,
+                strokeWidth,
+                strokeDashstyle
+            }
+        }
+    };
 }
 
 function SCColor() {
@@ -1721,13 +1719,18 @@ function SCColor() {
         }
     }
     //log('SCColor');
-    try { mapLayer.destroyFeatures();
-    }catch(err){log('err destroyFeatures: ', err);}
+    // Remove previously added features
+    try {
+        for (const fid of _csLayerFeatureIds) {
+            try { wmeSDK.Map.removeFeatureFromLayer({ layerName: 'Color Speeds', featureId: fid }); } catch(e) {}
+        }
+    } catch(err) { log('err clearFeatures: ', err); }
+    _csLayerFeatureIds = [];
 
     if (getTopCountry() === null) return;
 
     if ( CSpeedsCountries !== undefined && /*CSpeedsCountries.top*/getTopCountry() !== undefined){
-        getId('stateChoise').style.display = (/*CSpeedsCountries.top*/getTopCountry().attributes.name == 'United States') ? 'block' : 'none';
+        getId('stateChoise').style.display = (/*CSpeedsCountries.top*/getTopCountry().name == 'United States') ? 'block' : 'none';
     }
     var lineFeature = [];
 
@@ -1736,43 +1739,64 @@ function SCColor() {
         WMECSpeeds.typeOfRoad[type].checked = getId('cbRoad' + type).checked;
     }
 
-    for (var seg in CSpeedsModel.segments.objects) {
-        var segment = getByID(CSpeedsModel.segments, seg);
-        var attributes = segment.attributes;
-        var roadType = attributes.roadType;
-        var roundabout = (attributes.junctionID === null) ? false : true;
-        var line = getId(segment.getOLGeometry().id);
-        var fwdspeed = attributes.fwdMaxSpeed;
-        var revspeed = attributes.revMaxSpeed;
-        var fwdspeedUnverified = attributes.fwdMaxSpeedUnverified;
-        var revspeedUnverified = attributes.revMaxSpeedUnverified;
-        var fwddir = attributes.fwdDirection;
-        var revdir = attributes.revDirection;
-        //var fwdID = "",revID="";
-        var isSelected = (segment.selected == true) ? true : false;
-        var isModified = (segment.state == 'Update') ? true : false;
+    // Compute zoom and resolution once before loop
+    zoom = wmeSDK.Map.getZoomLevel();
+    let resolution = 1;
+    try {
+        if (typeof wmeSDK.Map.getResolution === 'function') {
+            resolution = wmeSDK.Map.getResolution();
+        } else {
+            resolution = 156543.03392 / Math.pow(2, zoom);
+        }
+    } catch(e) { resolution = 1; }
+    const shiftValue = WMECSpeeds.offsetValue * resolution;
 
-        if (attributes.primaryStreetID === null || attributes.primaryStreetID === undefined) continue;
+    const allSegments = wmeSDK.DataModel.Segments.getAll();
+    for (const segData of allSegments) {
+        const segId = segData.id;
+        // Use raw W.model for backward compat attributes not yet in SDK
+        const segment = CSpeedsModel?.segments?.getObjectById
+            ? CSpeedsModel.segments.getObjectById(segId)
+            : (CSpeedsModel?.segments?.get ? CSpeedsModel.segments.get(segId) : null);
 
-        if (getByID(CSpeedsModel.streets, attributes.primaryStreetID) === null || getByID(CSpeedsModel.streets, attributes.primaryStreetID) === undefined){
-            if (debug) log('CSpeedsModel.streets.get(' + attributes.primaryStreetID + ') =', getByID(CSpeedsModel.streets, attributes.primaryStreetID));
-            continue;
+        // segment from W.model is optional, segData from SDK is authoritative
+        // Use SDK segment data (segData) for all fields
+        var roadType = segData.roadType;
+        var roundabout = (segData.junctionId !== null && segData.junctionId !== undefined);
+        // SDK uses fwdSpeedLimit/revSpeedLimit (in km/h always from server)
+        var fwdspeed = segData.fwdSpeedLimit;
+        var revspeed = segData.revSpeedLimit;
+        var fwdspeedUnverified = !segData.isFwdSpeedLimitVerified;
+        var revspeedUnverified = !segData.isRevSpeedLimitVerified;
+        // isTwoWay means both directions; isAtoB/isBtoA are one-way flags
+        var fwddir = segData.isTwoWay || segData.isAtoB;
+        var revdir = segData.isTwoWay || segData.isBtoA;
+        var isSelected = false;
+        var isModified = false;
+        if (segment) {
+            isSelected = (segment.selected == true);
+            isModified = (segment.state == 'Update');
         }
 
-        var cid = getByID(CSpeedsModel.streets, attributes.primaryStreetID).attributes.cityID;
-        var stateID = null;
-        var countryID = null;
-
-        if (getByID(CSpeedsModel.cities, cid) === null || getByID(CSpeedsModel.cities, cid) === undefined){
-            if (debug) log('CSpeedsModel.cities.get(' + cid + ') =', getByID(CSpeedsModel.cities, cid));
-            continue;
+        // Get country/state via SDK
+        let countrie = 'Unknown';
+        let state = 'Unknown';
+        try {
+            const segCountry = wmeSDK.DataModel.Countries.getBySegmentId
+                ? wmeSDK.DataModel.Countries.getBySegmentId({ segmentId: segId })
+                : null;
+            if (segCountry) countrie = segCountry.name.replace(/ /g, '_');
+            const segState = wmeSDK.DataModel.States.getBySegmentId
+                ? wmeSDK.DataModel.States.getBySegmentId({ segmentId: segId })
+                : null;
+            if (segState) state = segState.name.replace(/ /g, '_');
+        } catch(e) {
+            // use top country/state as fallback
+            try {
+                countrie = (getTopCountry()?.name || 'Unknown').replace(/ /g, '_');
+                state = (getTopState()?.name || 'Unknown').replace(/ /g, '_');
+            } catch(e2) {}
         }
-
-        stateID = getByID(CSpeedsModel.cities, cid).attributes.stateID;
-        countryID = getByID(CSpeedsModel.cities, cid).attributes.countryID;
-
-        var state = getByID(CSpeedsModel.states, stateID).attributes.name.replace(/ /g, '_');
-        var countrie = getByID(CSpeedsModel.countries, countryID).attributes.name.replace(/ /g, '_');
 
         if (WMECSpeeds.PaletteByCountrie == true && WMECSpeeds.speedColors.Countries[countrie] === undefined){
             WMECSpeeds.speedColors.Countries[countrie] = {};
@@ -1790,12 +1814,6 @@ function SCColor() {
         // check that WME hasn't highlighted this segment
         if (isSelected || isModified) continue;
 
-        if (zoom != CSpeedsMap.olMap.zoom) {
-            zoom = CSpeedsMap.olMap.zoom;
-            //log('zoom = ' + zoom + 'W.map.getResolution() = '+W.map.getResolution());
-        }
-        var shiftValue = WMECSpeeds.offsetValue * W.map.getResolution();
-
         if (RoadToScan.indexOf(roadType) == -1 ) continue;
         if ((roundabout != false) && (WMECSpeeds.typeOfRoad['999'].checked == false)) continue;
 
@@ -1810,8 +1828,7 @@ function SCColor() {
         if ((zoom < WMECSpeeds.typeOfRoad[roadType].zoom) || !WMECSpeeds.typeOfRoad[roadType].checked) {
             continue;
         }
-        WMECSpeeds.visibility = mapLayer.visibility;
-
+        WMECSpeeds.visibility = (mapLayer.visible !== false);
         if (fwdspeed && WMECSpeeds.visibility) {
             //Color for forward speed
             var newWidth = '', newColor = '', newDashes = '', newOpacity = '';
@@ -1823,13 +1840,6 @@ function SCColor() {
             }else if (WMECSpeeds.MultiplePalette === true && WMECSpeeds.speedColors.US[state] !== undefined){
                 if (WMECSpeeds.speedColors.US[state][unit].hasOwnProperty(fwdspeed)) newColor = WMECSpeeds.speedColors.US[state][unit][fwdspeed];
             }
-            /*
-          if (newColor!=""){
-            //Dashes
-            if (fwddir==true && fwdspeed && !fwdspeedUnverified) { newWidth = 6; newOpacity = 0.8; newDashes = "5 10"; } // verified speed
-            else if (fwddir==true && fwdspeed && fwdspeedUnverified) { newColor = WMECSpeeds.speedColors.Others; newWidth = 4; newOpacity = 0.8; newDashes = "2 10";} // unverified speed
-          }else if (fwddir==true && fwdspeed) { newWidth = 4; newColor = WMECSpeeds.speedColors.Others; newOpacity = 0.9; newDashes = "5 5"; } // other
-          */
             if (newColor != ''){
             //Dashes
                 if (fwddir == true && fwdspeed && !fwdspeedUnverified) { newWidth = WMECSpeeds.thicknessValue; newOpacity = WMECSpeeds.opacityValue; newDashes = '5 10'; } // verified speed
@@ -1845,18 +1855,14 @@ function SCColor() {
                 };
 
                 var points = [];
-                var segID = attributes.id;
-                points = shiftGeometry(shiftValue, segment.getOLGeometry().getVertices(), CSpeedsModel.getTopCountry().getAttribute('leftHandTraffic'));
-
-                var newline = new CSpeedOpenLayers.Geometry.LineString(points);
-
-                lineFeature.push(new CSpeedOpenLayers.Feature.Vector(newline, null, style));
-            //log("segment id: " + attributes.id + ' newColor: '+ newColor + ' segment.CSpeedsFwd.fwdColor: ' + segment.CSpeedsFwd.fwdColor + ' lineFeature: ',lineFeature);
+                const verticesFwd2 = getSegmentVertices(segData);
+                points = shiftGeometry(shiftValue, verticesFwd2, getTopCountry().leftHandTraffic);
+                lineFeature.push(makeSDKLineFeature(points, style.strokeColor, style.strokeOpacity, style.strokeWidth, style.strokeDashstyle));
             }
         }
         if (revspeed && WMECSpeeds.visibility) {
             //Color for reverse speed
-            var newWidth = '', newColor = '', newDashes = '', newOpacity = '', newDashOffset = '';
+            var newWidth = '', newColor = '', newDashes = '', newOpacity = '';
 
             if (WMECSpeeds.MultiplePalette === false && WMECSpeeds.PaletteByCountrie === false){
                 if (WMECSpeeds.speedColors[unit].hasOwnProperty(revspeed)) newColor = WMECSpeeds.speedColors[unit][revspeed];
@@ -1865,13 +1871,6 @@ function SCColor() {
             }else if (WMECSpeeds.MultiplePalette === true && WMECSpeeds.speedColors.US[state] !== undefined){
                 if (WMECSpeeds.speedColors.US[state][unit].hasOwnProperty(revspeed)) newColor = WMECSpeeds.speedColors.US[state][unit][revspeed];
             }
-            /*
-            if (newColor!=""){
-                //Dashes
-                if (revdir==true && revspeed && !revspeedUnverified) { newWidth = 6; newOpacity = 0.8; newDashes = "5 10"; } // verified speed
-                else if (revdir==true && revspeed && revspeedUnverified) { newColor = WMECSpeeds.speedColors.Others; newWidth = 4; newOpacity = 0.8; newDashes = "2 10";} // unverified speed
-            }else if (revdir==true && revspeed) { newWidth = 4; newColor = WMECSpeeds.speedColors.Others; newOpacity = 0.9; newDashes = "5 5"; } // other
-            */
             if (newColor != ''){
                 //Dashes
                 if (revdir == true && revspeed && !revspeedUnverified) { newWidth = WMECSpeeds.thicknessValue; newOpacity = WMECSpeeds.opacityValue; newDashes = '5 10'; } // verified speed
@@ -1887,13 +1886,9 @@ function SCColor() {
                 };
 
                 var points = [];
-                var segID = attributes.id;
-
-                points = shiftGeometry(shiftValue, segment.getOLGeometry().getVertices(), !CSpeedsModel.getTopCountry().getAttribute('leftHandTraffic'));
-
-                var newline = new CSpeedOpenLayers.Geometry.LineString(points);
-
-                lineFeature.push(new CSpeedOpenLayers.Feature.Vector(newline, null, style));
+                const verticesRev2 = getSegmentVertices(segData);
+                points = shiftGeometry(shiftValue, verticesRev2, !getTopCountry().leftHandTraffic);
+                lineFeature.push(makeSDKLineFeature(points, style.strokeColor, style.strokeOpacity, style.strokeWidth, style.strokeDashstyle));
             }
         }
 
@@ -1902,11 +1897,21 @@ function SCColor() {
     // log("lineFeature = ",lineFeature);
     // Display new array of segments
     try {
-        mapLayer.addFeatures(lineFeature);
+        // Add features and track their IDs for cleanup next call
+    for (const feat of lineFeature) {
+        try {
+            wmeSDK.Map.addFeatureToLayer({ layerName: 'Color Speeds', feature: feat });
+            _csLayerFeatureIds.push(feat.id);
+        } catch(e) { log('addFeatureToLayer err: ' + e.message); }
+    }
     } catch (err) { log('err addFeatures: ', err); }
     if (debug) log(`Total load time without WW of ${Math.round(performance.now() - scriptStartTime)} ms.`);
     if (debug) log(`Total load time with WW of ${Math.round(performance.now() - loadStartTime)} ms.`);
 }
 
 /* begin running the code! */
-counterStart();
+if (typeof window.SDK_INITIALIZED !== 'undefined') {
+    window.SDK_INITIALIZED.then(counterStart);
+} else {
+    counterStart();
+}
